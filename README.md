@@ -5,7 +5,7 @@
 2. Unzip into ``./data``
 
 # Training 
-Call bash script ``./start_active_learning_experiment_baseline.sh`` for starting baseline experiment
+Call bash script ``./start_active_learning_experiment_baseline.sh`` for starting baseline experiment  
 Call ``./start_active_learning_experiment.sh`` for starting experiment with active learning approach
 
 # Experiment results
