@@ -37,7 +37,7 @@ def parse_args():
                         help='Percentage of training data for initial pretraining')
 
     parser.add_argument('--num-pretraining-epochs', type=int, default=10)
-    parser.add_argument('--active-learning-batch-size', type=int, default=4)
+    parser.add_argument('--active-learning-new-samples-size', type=int, default=4)
     parser.add_argument('--num-active-learning-epochs', type=int, default=3)
     parser.add_argument('--train-batch-size', type=int, default=16)
     parser.add_argument('--val-batch-size', type=int, default=48)
@@ -110,18 +110,13 @@ if __name__ == '__main__':
     model.to(torch.device('cuda:0'))
 
     # Creating datasets
-    train_dataset = DailyDialogDataset(root=args.data_root, subset='train', model_name=args.model_name,
+    full_train_dataset = DailyDialogDataset(root=args.data_root, subset='train', model_name=args.model_name,
                                        sent_max_len=args.sentence_max_len)
     val_dataset = DailyDialogDataset(root=args.data_root, subset='test', model_name=args.model_name,
                                      sent_max_len=args.sentence_max_len)
 
     # Making stratified pretraining loader
-    train_targets = train_dataset.labels
-    # train_idxs, _ = train_test_split(
-    #     np.arange(len(train_targets)),
-    #     train_size=args.pretraining_part,
-    #     shuffle=True,
-    #     stratify=train_targets)
+    train_targets = full_train_dataset.labels
     targets_indexes = {idx: [] for idx in range(4)}
     for idx, label in enumerate(train_targets):
         targets_indexes[label].append(idx)
@@ -129,7 +124,7 @@ if __name__ == '__main__':
     for label in range(4):
         train_idxs.extend(rnd.sample(targets_indexes[label], int(args.pretraining_part * len(targets_indexes[label]))))
 
-    train_dataset = torch.utils.data.Subset(train_dataset, indices=train_idxs)
+    train_dataset = torch.utils.data.Subset(full_train_dataset, indices=train_idxs)
     train_loader = DataLoader(train_dataset, args.train_batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, args.val_batch_size)
 
@@ -144,6 +139,7 @@ if __name__ == '__main__':
 
     # Pretraining with part of training data for few epochs
     print(f'Start pretraining for {args.num_pretraining_epochs} epochs')
+    validation_metrics = None
     for epoch_num in range(args.num_pretraining_epochs):
         train_step(model=model, loader=train_loader, optimizer=optimizer, lr_scheduler=lr_scheduler)
         validation_metrics = validation_step(model=model, loader=val_loader)
@@ -152,10 +148,12 @@ if __name__ == '__main__':
         # Saving pretraining metrics
         for cls_idx in range(4):
             tb_logger.add_scalar(f'Pretrain/f1_class_{cls_idx}', validation_metrics[cls_idx]['f1-score'], epoch_num)
+    # Saving pretrained model
+    torch.save(model, os.path.join(args.checkpoint_dir, args.experiment_name, 'pretrained_model.pth'))
 
     # Active learning stage
     # 1. Get class with worst metric (or randomly sampling in baseline case)
-    # 2. Add args.active_learning_batch_size samples of class from pt.1
+    # 2. Add args.active_learning_new_samples_size samples of class from pt.1
     # 3. Train args.num_active_learning_epochs
     # 4. Repeat 1-3 until samples exists
     # 5. Calculate final metrics
@@ -164,7 +162,8 @@ if __name__ == '__main__':
     results = {idx: [] for idx in range(4)}
 
     for iter_num in range(100000000):
-        if args.random_sample:
+        print(f'Start iteration {iter_num}')
+        if args.random_sample or validation_metrics is None:
             # Sample class number randomly
             cls_idx = rnd.randint(0, 3)
         else:
@@ -172,28 +171,31 @@ if __name__ == '__main__':
             cls_idx = get_cls_idx_with_worst_metric(validation_metrics)
 
         # Add few samples of cls_idx in dataset
-        if len(targets_indexes[cls_idx]) < args.active_learning_batch_size:
+        if len(targets_indexes[cls_idx]) < args.active_learning_new_samples_size:
             # If not enough new samples in dataset, then exit
             break
         else:
             # Add samples and create new dataset
-            train_idxs += rnd.sample(targets_indexes[cls_idx], args.active_learning_batch_size)
-            train_dataset = torch.utils.data.Subset(train_dataset, indices=train_idxs)
+            train_idxs += rnd.sample(targets_indexes[cls_idx], args.active_learning_new_samples_size)
+            train_dataset = torch.utils.data.Subset(full_train_dataset, indices=train_idxs)
             train_loader = DataLoader(train_dataset, args.train_batch_size, shuffle=True)
 
-        # Add visualization of new distribution of classes in tensorboard
-        classes_distr = Counter(train_dataset.labels)
-        tb_logger.add_histogram('ActiveLearning/ClassesDistribution',
-                                [classes_distr[idx] for idx in range(4)],
-                                iter_num)
+        print("Classes distribution:")
+        pprint(Counter(train_dataset.dataset.labels))
 
         for epoch_num in range(args.num_active_learning_epochs):
             train_step(model=model, loader=train_loader, optimizer=optimizer, lr_scheduler=lr_scheduler)
             validation_metrics = validation_step(model=model, loader=val_loader)
-            pprint(validation_metrics)
+        pprint(validation_metrics)
 
         # Saving pretraining metrics
         for cls_idx in range(4):
             tb_logger.add_scalar(f'ActiveLearning/f1_class_{cls_idx}',
                                  validation_metrics[cls_idx]['f1-score'],
                                  iter_num)
+        tb_logger.flush()
+
+        # Saving pretrained model
+        torch.save(model, os.path.join(args.checkpoint_dir,
+                                       args.experiment_name,
+                                       f'active_learning_iter_{iter_num}.pth'))
