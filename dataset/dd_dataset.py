@@ -53,21 +53,25 @@ class DailyDialogDataset(Dataset):
         targets = []
         for text_labels in labels:
             targets.extend(list(map(int, text_labels.replace('\n', '').strip().split(' '))))
-        return np.array(targets)
+
+        # In datasets indexing of classes starting with 1
+        targets = np.array(targets) - 1
+        return targets
 
     def get_batch_with_class(self, class_idx: int, batch_size: int = 1):
         # Get indexes of samples with class == class_idx
         class_indexes = np.argwhere(self.labels == class_idx).reshape(-1)
         # Sample batch_size of samples indexes
         batch_indexes = rnd.sample(class_indexes.tolist(), batch_size)
+        print(f'Sampling {batch_size} indexes: {batch_indexes}')
 
         # Creating batch
-        batch = None
-        for index in batch_indexes:
-            if batch is None: batch = self[index]
-            else:
-                for k, v in self[index].items():
-                    batch[k] = torch.stack([batch[k], v])
+        samples = [self[index] for index in batch_indexes]
+
+        batch = {}
+        for k in samples[0].keys():
+            batch[k] = torch.stack([sample[k] for sample in samples])
+
         return batch
 
     def __getitem__(self, idx):

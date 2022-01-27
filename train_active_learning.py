@@ -1,6 +1,13 @@
 import os
+import json
+import numpy as np
+import random as rnd
 import argparse as ap
 from tqdm import tqdm
+from pprint import pprint
+from collections import Counter
+
+from sklearn.model_selection import train_test_split
 
 from transformers import BertForSequenceClassification
 from transformers import AdamW, get_scheduler
@@ -9,6 +16,7 @@ from utils.metrics import Meter
 from dataset.dd_dataset import DailyDialogDataset
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 
 def parse_args():
@@ -29,26 +37,25 @@ def parse_args():
                         help='Percentage of training data for initial pretraining')
 
     parser.add_argument('--num-pretraining-epochs', type=int, default=10)
-    parser.add_argument('--active-learning-batch-size', type=int, default=2)
-    parser.add_argument('--train-batch-size', type=int, default=8)
-    parser.add_argument('--val-batch-size', type=int, default=24)
+    parser.add_argument('--active-learning-batch-size', type=int, default=4)
+    parser.add_argument('--num-active-learning-epochs', type=int, default=3)
+    parser.add_argument('--train-batch-size', type=int, default=16)
+    parser.add_argument('--val-batch-size', type=int, default=48)
 
+    parser.add_argument('--sentence-max-len', type=int, default=512)
     parser.add_argument('--initial-lr', type=float, default=5e-5)
+    parser.add_argument('--active-learning-lr', type=float, default=5e-7)
     parser.add_argument('--warmup-steps', type=int, default=100)
 
     return parser.parse_args()
 
 
-def train_step():
+def train_step(model, loader, optimizer, lr_scheduler):
     model.train()
-    for iter_idx, sample in tqdm(enumerate(train_loader), total=len(train_loader)):
-        input_ids = sample['input_ids'].to(torch.device('cuda:0'))
-        token_type_ids = sample['token_type_ids'].to(torch.device('cuda:0'))
-        attention_mask = sample['token_type_ids'].to(torch.device('cuda:0'))
-        labels = sample['labels'].to(torch.device('cuda:0'))
+    for iter_idx, sample in tqdm(enumerate(loader), total=len(loader)):
+        for k, v in sample.items(): sample[k] = v.to(torch.device('cuda:0'))
 
-        out = model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids,
-                    labels=labels)
+        out = model(**sample)
 
         loss = out.loss
         loss.backward()
@@ -57,26 +64,20 @@ def train_step():
         lr_scheduler.step()
         optimizer.zero_grad()
 
-        if iter_idx == 10: break
 
-
-def validation_step():
+def validation_step(model, loader):
     meter = Meter()
     model.eval()
-    for iter_idx, sample in tqdm(enumerate(val_loader), total=len(val_loader)):
-        input_ids = sample['input_ids'].to(torch.device('cuda:0'))
-        token_type_ids = sample['token_type_ids'].to(torch.device('cuda:0'))
-        attention_mask = sample['token_type_ids'].to(torch.device('cuda:0'))
-        labels = sample['labels'].to(torch.device('cuda:0'))
+    for iter_idx, sample in tqdm(enumerate(loader), total=len(loader)):
+        for k, v in sample.items(): sample[k] = v.to(torch.device('cuda:0'))
 
         with torch.no_grad():
-            out = model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids,
-                        labels=labels)
+            out = model(**sample)
 
         logits = out.logits
         predictions = torch.argmax(logits, dim=-1)
-        meter.update(predictions, labels)
-        if iter_idx == 10: break
+        meter.update(predictions, sample['labels'])
+
     return meter.get_report()
 
 
@@ -84,7 +85,7 @@ def get_cls_idx_with_worst_metric(validation_metrics):
     if validation_metrics is None: return 1
     else:
         min_f1, cls_idx = float('inf'), -1
-        for idx in range(5):
+        for idx in range(4):
             if validation_metrics[idx]['f1-score'] < min_f1:
                 min_f1 = validation_metrics[idx]['f1-score']
                 cls_idx = idx
@@ -92,27 +93,44 @@ def get_cls_idx_with_worst_metric(validation_metrics):
 
 
 if __name__ == '__main__':
+    rnd.seed(42)  # Set random state seed
     args = parse_args()
+    print(args)
     if not os.path.exists(os.path.join(args.logs_dir, args.experiment_name)):
         os.makedirs(os.path.join(args.logs_dir, args.experiment_name))
 
     if not os.path.exists(os.path.join(args.checkpoint_dir, args.experiment_name)):
         os.makedirs(os.path.join(args.checkpoint_dir, args.experiment_name))
 
+    tb_logger = SummaryWriter(os.path.join(args.logs_dir, args.experiment_name))
+
     # Creating model
     print('Creating model...')
-    model = BertForSequenceClassification.from_pretrained(args.model_name, num_labels=5)
+    model = BertForSequenceClassification.from_pretrained(args.model_name, num_labels=4)
     model.to(torch.device('cuda:0'))
-    print('Model created')
-    print(model)
 
     # Creating datasets
     train_dataset = DailyDialogDataset(root=args.data_root, subset='train', model_name=args.model_name,
                                        sent_max_len=args.sentence_max_len)
-    val_dataset = DailyDialogDataset(root=args.data_root, subset='validation', model_name=args.model_name,
+    val_dataset = DailyDialogDataset(root=args.data_root, subset='test', model_name=args.model_name,
                                      sent_max_len=args.sentence_max_len)
 
-    train_loader = DataLoader(train_dataset, args.train_batch_size)
+    # Making stratified pretraining loader
+    train_targets = train_dataset.labels
+    # train_idxs, _ = train_test_split(
+    #     np.arange(len(train_targets)),
+    #     train_size=args.pretraining_part,
+    #     shuffle=True,
+    #     stratify=train_targets)
+    targets_indexes = {idx: [] for idx in range(4)}
+    for idx, label in enumerate(train_targets):
+        targets_indexes[label].append(idx)
+    train_idxs = []
+    for label in range(4):
+        train_idxs.extend(rnd.sample(targets_indexes[label], int(args.pretraining_part * len(targets_indexes[label]))))
+
+    train_dataset = torch.utils.data.Subset(train_dataset, indices=train_idxs)
+    train_loader = DataLoader(train_dataset, args.train_batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, args.val_batch_size)
 
     # Creating optimizer and scheduler
@@ -121,46 +139,61 @@ if __name__ == '__main__':
         "linear",
         optimizer=optimizer,
         num_warmup_steps=args.warmup_steps,
-        num_training_steps=args.num_epochs * len(train_loader)
+        num_training_steps=args.num_pretraining_epochs * len(train_loader)
     )
 
     # Pretraining with part of training data for few epochs
     print(f'Start pretraining for {args.num_pretraining_epochs} epochs')
-    meter = Meter()
-    validation_metrics = None
     for epoch_num in range(args.num_pretraining_epochs):
-        train_step()
-        validation_metrics = validation_step()
-        print(validation_metrics)
+        train_step(model=model, loader=train_loader, optimizer=optimizer, lr_scheduler=lr_scheduler)
+        validation_metrics = validation_step(model=model, loader=val_loader)
+        pprint(validation_metrics)
 
-    print('Classification report after pretraining:')
-    print(meter.get_report())
+        # Saving pretraining metrics
+        for cls_idx in range(4):
+            tb_logger.add_scalar(f'Pretrain/f1_class_{cls_idx}', validation_metrics[cls_idx]['f1-score'], epoch_num)
 
     # Active learning stage
-    print('Starting active learning stage')
-    meter = Meter()
-    for iter_num in range(args.num_iterations):
-        # Get class index with worst F1-score
-        cls_idx = get_cls_idx_with_worst_metric(validation_metrics)
+    # 1. Get class with worst metric (or randomly sampling in baseline case)
+    # 2. Add args.active_learning_batch_size samples of class from pt.1
+    # 3. Train args.num_active_learning_epochs
+    # 4. Repeat 1-3 until samples exists
+    # 5. Calculate final metrics
 
-        # Get samples with class cls_idx
-        sample = train_dataset.get_batch_with_class(cls_idx, args.active_learning_batch_size)
-        input_ids = sample['input_ids'].to(torch.device('cuda:0'))
-        token_type_ids = sample['token_type_ids'].to(torch.device('cuda:0'))
-        attention_mask = sample['token_type_ids'].to(torch.device('cuda:0'))
-        labels = sample['labels'].to(torch.device('cuda:0'))
+    optimizer = AdamW(model.parameters(), lr=args.active_learning_lr)
+    results = {idx: [] for idx in range(4)}
 
-        # fine-tune model
-        out = model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids,
-                    labels=labels)
-        loss = out.loss
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+    for iter_num in range(100000000):
+        if args.random_sample:
+            # Sample class number randomly
+            cls_idx = rnd.randint(0, 3)
+        else:
+            # Get class with worst F1 score
+            cls_idx = get_cls_idx_with_worst_metric(validation_metrics)
 
-        # Compute metrics
-        validation_metrics = validation_step()
+        # Add few samples of cls_idx in dataset
+        if len(targets_indexes[cls_idx]) < args.active_learning_batch_size:
+            # If not enough new samples in dataset, then exit
+            break
+        else:
+            # Add samples and create new dataset
+            train_idxs += rnd.sample(targets_indexes[cls_idx], args.active_learning_batch_size)
+            train_dataset = torch.utils.data.Subset(train_dataset, indices=train_idxs)
+            train_loader = DataLoader(train_dataset, args.train_batch_size, shuffle=True)
 
-    print('Classification report after active learning stage:')
-    print(meter.get_report())
+        # Add visualization of new distribution of classes in tensorboard
+        classes_distr = Counter(train_dataset.labels)
+        tb_logger.add_histogram('ActiveLearning/ClassesDistribution',
+                                [classes_distr[idx] for idx in range(4)],
+                                iter_num)
 
+        for epoch_num in range(args.num_active_learning_epochs):
+            train_step(model=model, loader=train_loader, optimizer=optimizer, lr_scheduler=lr_scheduler)
+            validation_metrics = validation_step(model=model, loader=val_loader)
+            pprint(validation_metrics)
+
+        # Saving pretraining metrics
+        for cls_idx in range(4):
+            tb_logger.add_scalar(f'ActiveLearning/f1_class_{cls_idx}',
+                                 validation_metrics[cls_idx]['f1-score'],
+                                 iter_num)
