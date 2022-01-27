@@ -50,7 +50,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_step(model, loader, optimizer, lr_scheduler):
+def train_step(model, loader, optimizer, lr_scheduler = None):
     model.train()
     for iter_idx, sample in tqdm(enumerate(loader), total=len(loader)):
         for k, v in sample.items(): sample[k] = v.to(torch.device('cuda:0'))
@@ -61,7 +61,7 @@ def train_step(model, loader, optimizer, lr_scheduler):
         loss.backward()
 
         optimizer.step()
-        lr_scheduler.step()
+        if lr_scheduler is not None: lr_scheduler.step()
         optimizer.zero_grad()
 
 
@@ -111,7 +111,7 @@ if __name__ == '__main__':
 
     # Creating datasets
     full_train_dataset = DailyDialogDataset(root=args.data_root, subset='train', model_name=args.model_name,
-                                       sent_max_len=args.sentence_max_len)
+                                            sent_max_len=args.sentence_max_len)
     val_dataset = DailyDialogDataset(root=args.data_root, subset='test', model_name=args.model_name,
                                      sent_max_len=args.sentence_max_len)
 
@@ -130,18 +130,15 @@ if __name__ == '__main__':
 
     # Creating optimizer and scheduler
     optimizer = AdamW(model.parameters(), lr=args.initial_lr)
-    lr_scheduler = get_scheduler(
-        "linear",
-        optimizer=optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=args.num_pretraining_epochs * len(train_loader)
-    )
+
+    print("Classes distribution:")
+    pprint(Counter([full_train_dataset[idx]['labels'].item() for idx in train_idxs]))
 
     # Pretraining with part of training data for few epochs
     print(f'Start pretraining for {args.num_pretraining_epochs} epochs')
     validation_metrics = None
     for epoch_num in range(args.num_pretraining_epochs):
-        train_step(model=model, loader=train_loader, optimizer=optimizer, lr_scheduler=lr_scheduler)
+        train_step(model=model, loader=train_loader, optimizer=optimizer)
         validation_metrics = validation_step(model=model, loader=val_loader)
         pprint(validation_metrics)
 
@@ -181,10 +178,10 @@ if __name__ == '__main__':
             train_loader = DataLoader(train_dataset, args.train_batch_size, shuffle=True)
 
         print("Classes distribution:")
-        pprint(Counter(train_dataset.dataset.labels))
+        pprint(Counter([full_train_dataset[idx]['labels'].item() for idx in train_idxs]))
 
         for epoch_num in range(args.num_active_learning_epochs):
-            train_step(model=model, loader=train_loader, optimizer=optimizer, lr_scheduler=lr_scheduler)
+            train_step(model=model, loader=train_loader, optimizer=optimizer)
             validation_metrics = validation_step(model=model, loader=val_loader)
         pprint(validation_metrics)
 
@@ -195,7 +192,8 @@ if __name__ == '__main__':
                                  iter_num)
         tb_logger.flush()
 
-        # Saving pretrained model
-        torch.save(model, os.path.join(args.checkpoint_dir,
-                                       args.experiment_name,
-                                       f'active_learning_iter_{iter_num}.pth'))
+        if not iter_num % 10:
+            # Saving pretrained model
+            torch.save(model, os.path.join(args.checkpoint_dir,
+                                           args.experiment_name,
+                                           f'active_learning_iter_{iter_num}.pth'))
